@@ -16,9 +16,19 @@
 #include "include/chainer_trt_impl.hpp"
 #include "test_helper.hpp"
 
+// int: batch size
+// std::string base path to the fixture
+// std::vector<std::string> input data CSV files
+// std::vector<std::string> expected output value CSV files
+// std::vector<nvinfer1::Dims> expected output dimensions
+// nvinfer1::DataType In which mode will this test case run
+// float tolerance of value assertion
+// std::string calibration cache file (only used in INT8 mode)
+// std::vector<std::string> external plugin name list
 using TestParams =
-  std::tuple<int, std::string, std::vector<std::string>, std::string,
-             nvinfer1::Dims, nvinfer1::DataType, float, std::string>;
+  std::tuple<int, std::string, std::vector<std::string>,
+             std::vector<std::string>, std::vector<nvinfer1::Dims>,
+             nvinfer1::DataType, float, std::string, std::vector<std::string>>;
 
 // tuple params:
 // batch_size, model_path, input_file_list, expected_output_file,
@@ -27,18 +37,21 @@ class TensorRTBuilderTestFixture : public ::testing::TestWithParam<TestParams> {
 public:
     std::shared_ptr<chainer_trt::model>
     make_model(const std::string& model_dir, nvinfer1::DataType dt,
-               const std::string& int8_calib_cache, int batch_size) const {
+               const std::string& int8_calib_cache, int batch_size,
+               std::shared_ptr<chainer_trt::plugin::plugin_factory> factory) const {
         if(dt == nvinfer1::DataType::kFLOAT)
-            return chainer_trt::model::build_fp32(model_dir, 2, batch_size);
+            return chainer_trt::model::build_fp32(
+              model_dir, 2, batch_size, factory);
         else if(dt == nvinfer1::DataType::kHALF)
-            return chainer_trt::model::build_fp16(model_dir, 2, batch_size);
+            return chainer_trt::model::build_fp16(
+              model_dir, 2, batch_size, factory);
         else if(dt == nvinfer1::DataType::kINT8 && !int8_calib_cache.size())
             // If no calib cache is specified, use 1000 random data.
             return chainer_trt::model::build_int8(
-              model_dir, std::make_shared<BS>(1000), 2, batch_size);
+              model_dir, std::make_shared<BS>(1000), 2, batch_size, "", factory);
         else if(dt == nvinfer1::DataType::kINT8 && int8_calib_cache.size())
             return chainer_trt::model::build_int8_cache(
-              model_dir, int8_calib_cache, 2, batch_size);
+              model_dir, int8_calib_cache, 2, batch_size, factory);
         return std::shared_ptr<chainer_trt::model>();
     }
 
@@ -60,14 +73,25 @@ TEST_P(TensorRTBuilderTestFixture, TestWithSerialize) {
     const std::string base_path = "test/fixtures/model/";
     const std::string export_path = base_path + std::get<1>(param) + "/";
     const std::vector<std::string> inputs = std::get<2>(param);
-    const std::string expected_output_fn = std::get<3>(param);
-    const nvinfer1::Dims expected_output_dims = std::get<4>(param);
+    const std::vector<std::string> expected_output_fns = std::get<3>(param);
+    const std::vector<nvinfer1::Dims> expected_output_dims = std::get<4>(param);
     const nvinfer1::DataType model_mode = std::get<5>(param);
     const float allowed_relative_error = std::get<6>(param);
     const std::string int8_calib_cache = std::get<7>(param);
+    const std::vector<std::string> external_plugin_names = std::get<8>(param);
 
-    const auto model_src =
-      make_model(export_path, model_mode, int8_calib_cache, batch_size);
+    // Make plugin factory
+    auto factory = std::make_shared<chainer_trt::plugin::plugin_factory>();
+    for(auto plugin_name : external_plugin_names) {
+        switch(plugin_name) {
+          case "Increment3":
+            // factory->add_builder_deserializer(plugin_name, , );
+            break;
+        }
+    }
+
+    const auto model_src = make_model(export_path, model_mode, int8_calib_cache,
+                                      batch_size, factory);
 
     // Serialize
     std::ostringstream oss;
@@ -75,22 +99,7 @@ TEST_P(TensorRTBuilderTestFixture, TestWithSerialize) {
 
     // Deserialize
     std::istringstream iss(oss.str());
-    const auto model = chainer_trt::model::deserialize(iss);
-    chainer_trt::infer rt(model);
-
-    // Load expected output
-    const auto out_vals = load_values<float>(export_path + expected_output_fn);
-    const auto expected_output = repeat_array(out_vals, batch_size);
-
-    // Get output dimension and check
-    int n_output = 1;
-    const auto output_dim = model->get_output_dimensions(0);
-    ASSERT_EQ(output_dim.size(), expected_output_dims.nbDims);
-    for(unsigned i = 0; i < output_dim.size(); ++i) {
-        ASSERT_EQ(output_dim[i], expected_output_dims.d[i]);
-        n_output *= output_dim[i];
-    }
-    ASSERT_EQ(n_output * batch_size, expected_output.size());
+    const auto model = chainer_trt::model::deserialize(iss, factory);
 
     // Load inputs and check dimensions
     ASSERT_EQ(model->get_n_inputs(), inputs.size());
@@ -106,12 +115,37 @@ TEST_P(TensorRTBuilderTestFixture, TestWithSerialize) {
         ASSERT_EQ(input_vecs.back().size(), n_input_i * batch_size);
     }
 
-    // Run inference
-    std::vector<float> output(n_output * batch_size);
-    std::vector<void*> out_dst{output.data()};
-    rt.infer_from_cpu(batch_size, input_bufs, out_dst);
+    // Get output dimension and check
+    ASSERT_EQ(model->get_n_outputs(), expected_output_fns.size());
+    ASSERT_EQ(model->get_n_outputs(), expected_output_dims.size());
+    std::vector<std::vector<float>> expected_outputs, outputs;
+    std::vector<void*> out_bufs;
+    for(int out_idx = 0; out_idx < model->get_n_outputs(); ++out_idx) {
+        int out_size = 1;
+        const auto output_dim = model->get_output_dimensions(out_idx);
+        ASSERT_EQ(output_dim.size(), expected_output_dims[out_idx].nbDims);
+        for(unsigned i = 0; i < output_dim.size(); ++i) {
+            ASSERT_EQ(output_dim[i], expected_output_dims[out_idx].d[i]);
+            out_size *= output_dim[i];
+        }
+        auto expected_out_fn = expected_output_fns[out_idx];
+        const auto out_vals = load_values<float>(export_path + expected_out_fn);
+        const auto expected_output = repeat_array(out_vals, batch_size);
+        expected_outputs.push_back(expected_output);
 
-    assert_values(expected_output, output, allowed_relative_error);
+        outputs.push_back(std::vector<float>(out_size * batch_size, 0));
+        out_bufs.push_back(outputs[out_idx].data());
+    }
+
+    // Run inference
+    chainer_trt::infer rt(model);
+    rt.infer_from_cpu(batch_size, input_bufs, out_bufs);
+
+    // Assertion by comparing outputs
+    for(int out_idx = 0; out_idx < model->get_n_outputs(); ++out_idx) {
+        assert_values(expected_outputs[out_idx], outputs[out_idx],
+                      allowed_relative_error);
+    }
 }
 
 // Load parameterized test cases from JSON file
@@ -135,14 +169,21 @@ std::vector<TestParams> load_params(const std::string& fixture_json_file) {
         for(auto in_obj : inputs_obj)
             inputs.push_back(in_obj.get<std::string>());
 
-        auto expected_output =
-          f.find("expected_output")->second.get<std::string>();
+        std::vector<std::string> expected_outputs;
+        auto outputs_obj =
+          f.find("expected_outputs")->second.get<picojson::array>();
+        for(auto out_obj : outputs_obj)
+            expected_outputs.push_back(out_obj.get<std::string>());
 
-        nvinfer1::Dims out_dim;
-        out_dim.nbDims = 0;
-        auto outdims_obj = f.find("output_dims")->second.get<picojson::array>();
-        for(auto outdim_obj : outdims_obj)
-            out_dim.d[out_dim.nbDims++] = int(outdim_obj.get<double>());
+        std::vector<nvinfer1::Dims> out_dims;
+        for(auto dim : f.find("output_dims")->second.get<picojson::array>()) {
+            auto dim_obj = dim.get<picojson::array>();
+            nvinfer1::Dims out_dim;
+            out_dim.nbDims = 0;
+            for(auto outdim_obj : dim_obj)
+                out_dim.d[out_dim.nbDims++] = int(outdim_obj.get<double>());
+            out_dims.push_back(out_dim);
+        }
 
         auto batch_size = int(f.find("batch_size")->second.get<double>());
         auto error = f.find("acceptable_absolute_error")->second.get<double>();
@@ -163,8 +204,13 @@ std::vector<TestParams> load_params(const std::string& fixture_json_file) {
         auto int8_calib_cache =
           f.find("int8_calib_cache")->second.get<std::string>();
 
-        ret.push_back(TestParams((int)batch_size, name, inputs, expected_output,
-                                 out_dim, dtype, error, int8_calib_cache));
+        std::vector<std::string> external_plugins;
+        for(auto p : f.find("external_plugins")->second.get<picojson::array>())
+            external_plugins.push_back(p.get<std::string>());
+
+        ret.push_back(TestParams((int)batch_size, name, inputs,
+                                 expected_outputs, out_dims, dtype, error,
+                                 int8_calib_cache, external_plugins));
     }
 
     return ret;

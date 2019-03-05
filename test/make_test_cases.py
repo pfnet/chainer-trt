@@ -21,7 +21,8 @@ default_err_zero = error(0, 0, 0)
 
 
 def generator(errs=default_err_strict, batch_sizes=(1, 1024),
-              name_suffix='', int8_calib_cache=''):
+              name_suffix='', int8_calib_cache='',
+              custom_dump_functions=dict()):
     """Use this decorator for test case generation function
 
     By using @generator() for your generation function, this script
@@ -44,7 +45,7 @@ def generator(errs=default_err_strict, batch_sizes=(1, 1024),
     def decorator(func):
         assert len(errs) == 3
         generators.append((func, errs, batch_sizes, name_suffix,
-                          int8_calib_cache))
+                          int8_calib_cache, custom_dump_functions))
     return decorator
 
 
@@ -424,6 +425,28 @@ def matmul():
                 return {'input-0': x0, 'input-1': x1}, {'out': y}
 
 
+# Multiple output test
+
+class Increment3(chainer.FunctionNode):
+    def forward_cpu(self, inputs):
+        x = inputs[0]
+        return (x + 1, x + 2, x + 3)
+
+
+def dump_increment3(model_retriever, func, initial_params):
+    source = model_retriever.get_source_name(func.inputs[0])
+    initial_params['source'] = source
+    return initial_params, None     # No weights
+
+
+@generator(custom_dump_functions={Increment3: dump_increment3})
+def multiple_outputs():
+    x = rand((1, 3, 10, 10))
+    f = Increment3()
+    y0, y1, y2 = f.apply((x,))
+    return {'input': x}, {'y0': y0, 'y1': y1, 'y2': y2}
+
+
 @generator_set
 def regression_imagenets():
     """Generates ImageNet models for regression tests
@@ -480,13 +503,17 @@ def main():
     args = parser.parse_args()
 
     test_cases = []
-    for gen, errs, batch_sizes, name_suffix, int8_calib_cache in generators:
+    for gen_info in generators:
+        gen, errs, batch_sizes, name_suffix, \
+                int8_calib_cache, custom_dump_functions = gen_info
         case_name = gen.__name__ + name_suffix
         if not fnmatch.fnmatch(case_name, args.filter):
             continue
 
         out = 'test/fixtures/model/' + case_name
         retriever = chainer_trt.ModelRetriever(out)
+        for fun, dump in custom_dump_functions.items():
+            retriever.add_dump_function(fun, dump)
         with chainer.using_config('train', False):
             with chainer_trt.RetainHook():
                 inputs, outputs = gen()
@@ -509,10 +536,6 @@ def main():
             open(out + '/' + fn, "wt").write(atos(y))
             output_shapes.append(y.shape[1:])
 
-        # Currently only 1 output is supported...
-        assert len(output_csv_names) == 1, \
-            "Currently only 1 output is supported..."
-
         # Save dumped test case network (model.json)
         retriever.save()
 
@@ -521,10 +544,12 @@ def main():
             for dtype, error in zip(['kFLOAT', 'kHALF', 'kINT8'], errs):
                 test_cases.append({
                     "fixture": case_name, "inputs": input_csv_names,
-                    "expected_output": output_csv_names[0],
-                    "output_dims": output_shapes[0],
+                    "expected_outputs": output_csv_names,
+                    "output_dims": output_shapes,
                     "batch_size": bs, "dtype": dtype,
                     "acceptable_absolute_error": error,
+                    "external_plugins": [f.__name__ for f
+                                         in custom_dump_functions.keys()],
 
                     # This is only used for int8 mode
                     "int8_calib_cache": int8_calib_cache
